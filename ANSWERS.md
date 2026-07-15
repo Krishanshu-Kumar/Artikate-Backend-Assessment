@@ -49,6 +49,108 @@ regression is a function of data volume, not code correctness, which is
 why it passed review and testing but failed in production for larger
 tenants.
 
+
+### Section 2 — Worker SIGKILL Behavior
+
+Section 2 — Rate-Limited Async Job Queue
+
+Why Celery + Redis (not Django-Q or custom)
+
+I chose Celery with a Redis broker. Redis was already needed for the rate
+limiter, so using it as the Celery broker too meant no extra infrastructure.
+Celery's retry and crash-recovery tools (acks_late, reject_on_worker_lost)
+are mature and battle-tested — building that myself would mean re-solving a
+problem Celery already solves well. Django-Q is lighter weight, but its
+crash-recovery story is less proven, and this task specifically needs strong
+guarantees around "worker crashes mid-job."
+
+Why a sliding window rate limiter (not token bucket or fixed window)
+
+I used a Redis sorted set with ZREMRANGEBYSCORE (sliding window log).
+
+
+A fixed window (e.g. reset every 60 seconds) has a boundary problem:
+200 requests right before the window resets + 200 right after means 400
+in a couple seconds, even though each window looked fine on its own. Given
+the brief's flash-sale burst scenario, this felt risky.
+A token bucket avoids that problem and is cheaper, but a sliding
+window gives an exact count of requests in the last N seconds with no
+approximation, which felt safer for a hard third-party limit.
+
+
+How it works: each allowed request adds an entry to a Redis sorted set,
+scored by timestamp. To check if a new request is allowed, a single Lua
+script: drops entries older than the window, counts what's left, and adds
+the new entry only if under the limit. All of this runs as one atomic Redis
+operation — no separate "check, then write" steps that could race under
+concurrent workers.
+
+Redis failure: the limiter fails open — if Redis is unreachable, it
+lets the email through rather than blocking it. Losing a handful of
+transactional emails (OTPs, order confirmations) because Redis was
+temporarily down felt worse than briefly exceeding the provider's rate
+limit, which is a soft cost (maybe a 429), not a lost message.
+
+Retry and dead-letter handling
+
+Failed sends retry with exponential backoff (2s, 4s, 8s, 16s, 32s). After 5
+real failures, the job is moved to a DeadLetterJob table instead of being
+dropped, so it can be inspected or manually retried later (there's a
+"Requeue" action wired up in Django admin for this).
+
+One bug I hit while testing: I originally used Celery's built-in retry
+counter to decide when a job had failed "too many times." But that counter
+also increments every time the rate limiter says "not your turn yet" —
+which happens constantly and is completely normal under burst load. This
+meant jobs could get wrongly dead-lettered just for waiting in line, not
+for actually failing. Fix: I track real send failures separately from
+rate-limit waits, so only genuine provider failures count toward the
+dead-letter threshold.
+
+What happens if a worker is SIGKILL'd mid-task?
+
+By default, Celery acknowledges a task the moment a worker picks it up —
+before running it. So if the worker is killed while the task is running,
+the task is already marked "done" and is lost forever.
+
+I set acks_late=True, which delays the acknowledgement until after the
+task finishes successfully. If the worker dies mid-task, the task was never
+acknowledged, so Redis makes it available again for another worker to pick
+up. I also set task_reject_on_worker_lost=True, which explicitly requeues
+a task if Celery detects the worker process itself has died. And
+worker_prefetch_multiplier=1 means a worker only ever holds the one task
+it's actively running — without this, a killed worker could have several
+unacknowledged tasks in flight, and all of them would get redelivered and
+re-run, multiplying side effects instead of just retrying the one
+interrupted job.
+
+Trade-off: this means a task can run more than once — if the worker
+dies after sending the email but before the acknowledgement goes
+through, the job gets redelivered and the email could be sent twice. This
+is Celery's "at-least-once" guarantee, not "exactly-once." My task isn't
+currently idempotent against this specific edge case — a more complete fix
+would check EmailSendRecord for an existing "sent" row before calling the
+provider again. I'm noting this as a known gap rather than assuming it away.
+
+Testing
+
+jobs/test_queue.py submits 500 jobs and checks three things:
+
+
+No job is lost — every job ends up with a final sent status (none
+silently disappear).
+The rate limit is never exceeded — I check every point in time
+against how many requests were allowed in the trailing window.
+A forced failure is retried and recovers — one job is set up to fail
+its first send attempt, then succeed; the test confirms it retried and
+ended up sent, not dead-lettered.
+
+
+Note: the test runs against a scaled-down limit (20 requests / 3 seconds)
+instead of the real 200/60, purely so the test finishes in a reasonable
+time. It's the same code path and same atomicity guarantees, just a smaller
+window.
+
 ## Section 3 — Multi-Tenant Data Isolation
 
 ### Approach
