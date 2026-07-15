@@ -1,5 +1,54 @@
 # ANSWERS.md — Artikate Studio Backend Assessment
 
+## Section 1 — Incident Investigation Log
+
+**Symptom**: `/api/orders/summary/` times out (30s+) for tenants with 200+
+orders. No code change was made to the view itself; the regression
+appeared after a routine deployment.
+
+**Step 1 — Ruled out the obvious first: was the view actually unchanged?**
+Checked git history for the file — confirmed no changes to `orders/views.py`
+in the deploy in question. This ruled out a direct logic bug in the view
+and pointed toward something the view depends on changing underneath it.
+
+**Step 2 — Checked what *did* change in that deployment.**
+The deployment introduced a new `OrderItem` model with a ForeignKey to
+`Order`. This is the kind of change that's easy to dismiss as "just a new
+table" but is exactly the type of change that breaks an existing view
+silently: if any code touches a new relation inside a loop, it doesn't
+throw an error, it just adds queries — and the failure mode is a slow
+timeout, not a crash, which makes it dangerous.
+
+**Step 3 — Formed a hypothesis before touching the debugger.**
+Hypothesis: the summary view iterates over `Order.objects.all()` and, for
+each order, separately queries into the new `OrderItem` relation (e.g.
+`order.items.count()` and `order.items.all()`). If true, query count would
+scale linearly with order count — which matches the reported symptom
+exactly (only tenants with 200+ orders are affected; smaller tenants
+wouldn't notice).
+
+**Step 4 — Verified with django-silk rather than guessing.**
+Installed and wired up django-silk, hit the endpoint via curl with a
+seeded tenant (250 orders), and inspected the request detail page.
+
+    Result: 501 queries, 994ms total, 186ms spent purely on database queries.
+
+This matches the hypothesis almost exactly: 1 base query for the orders
+themselves, plus 2 queries per order (one `.count()`, one `.all()` on the
+`items` relation) — 1 + (250 × 2) = 501.
+
+**Root cause category**: N+1 query problem. Specifically, the view accesses
+a related model (`OrderItem`) inside a per-row loop without using
+`prefetch_related`, so Django issues one additional query per related
+lookup per row instead of batching them into a single query up front.
+
+**Why this specific bug wasn't caught pre-deployment**: it only manifests
+as a timeout at higher row counts — a tenant with 5 orders (like the test
+tenant used in initial QA) would see 11 queries, imperceptibly fast. The
+regression is a function of data volume, not code correctness, which is
+why it passed review and testing but failed in production for larger
+tenants.
+
 ## Section 3 — Multi-Tenant Data Isolation
 
 ### Approach
